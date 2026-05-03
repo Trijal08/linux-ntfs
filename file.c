@@ -62,7 +62,10 @@ static int ntfs_file_open(struct inode *vi, struct file *filp)
 			return -EOVERFLOW;
 	}
 
-	filp->f_mode |= FMODE_NOWAIT | FMODE_CAN_ODIRECT;
+	filp->f_mode |= FMODE_NOWAIT;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+	filp->f_mode |= FMODE_CAN_ODIRECT;
+#endif
 
 	return generic_file_open(vi, filp);
 }
@@ -346,9 +349,11 @@ static int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 int ntfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct iattr *attr)
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 int ntfs_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
 		 struct iattr *attr)
+#else
+int ntfs_setattr(struct dentry *dentry, struct iattr *attr)
 #endif
 {
 	struct inode *vi = d_inode(dentry);
@@ -362,8 +367,10 @@ int ntfs_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 	err = setattr_prepare(idmap, dentry, attr);
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 	err = setattr_prepare(mnt_userns, dentry, attr);
+#else
+	err = setattr_prepare(dentry, attr);
 #endif
 	if (err)
 		goto out;
@@ -381,15 +388,19 @@ int ntfs_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 	setattr_copy(idmap, vi, attr);
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 	setattr_copy(mnt_userns, vi, attr);
+#else
+	setattr_copy(vi, attr);
 #endif
 
 	if (vol->sb->s_flags & SB_POSIXACL && !S_ISLNK(vi->i_mode)) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 		err = posix_acl_chmod(idmap, dentry, vi->i_mode);
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 		err = posix_acl_chmod(mnt_userns, vi, vi->i_mode);
+#else
+		err = posix_acl_chmod(vi, vi->i_mode);
 #endif
 		if (err)
 			goto out;
@@ -429,10 +440,13 @@ out:
 int ntfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 		struct kstat *stat, unsigned int request_mask,
 		unsigned int query_flags)
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 int ntfs_getattr(struct user_namespace *mnt_userns, const struct path *path,
 		struct kstat *stat, unsigned int request_mask,
 		unsigned int query_flags)
+#else
+int ntfs_getattr(const struct path *path, struct kstat *stat,
+		unsigned int request_mask, unsigned int query_flags)
 #endif
 {
 	struct inode *inode = d_backing_inode(path->dentry);
@@ -444,8 +458,10 @@ int ntfs_getattr(struct user_namespace *mnt_userns, const struct path *path,
 #else
 	generic_fillattr(idmap, inode, stat);
 #endif
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 	generic_fillattr(mnt_userns, inode, stat);
+#else
+	generic_fillattr(inode, stat);
 #endif
 
 	stat->blksize = NTFS_SB(inode->i_sb)->cluster_size;
@@ -474,6 +490,7 @@ int ntfs_getattr(struct user_namespace *mnt_userns, const struct path *path,
 	 * does not support DIO. For normal files, we report the bdev
 	 * logical block size.
 	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	if (request_mask & STATX_DIOALIGN && S_ISREG(inode->i_mode)) {
 		unsigned int align =
 			bdev_logical_block_size(inode->i_sb->s_bdev);
@@ -484,6 +501,7 @@ int ntfs_getattr(struct user_namespace *mnt_userns, const struct path *path,
 			stat->dio_offset_align = align;
 		}
 	}
+#endif
 
 	return 0;
 }
@@ -557,12 +575,18 @@ inode_unlock:
 }
 
 static int ntfs_file_write_dio_end_io(struct kiocb *iocb, ssize_t size,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 		int error, unsigned int flags)
+#else
+		unsigned int flags)
+#endif
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	if (error)
 		return error;
+#endif
 
 	if (size) {
 		if (i_size_read(inode) < iocb->ki_pos + size) {
@@ -574,9 +598,11 @@ static int ntfs_file_write_dio_end_io(struct kiocb *iocb, ssize_t size,
 	return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 static const struct iomap_dio_ops ntfs_write_dio_ops = {
 	.end_io			= ntfs_file_write_dio_end_io,
 };
+#endif
 
 static ssize_t ntfs_dio_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
@@ -588,10 +614,10 @@ static ssize_t ntfs_dio_write_iter(struct kiocb *iocb, struct iov_iter *from)
 #else
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)
 	ret = iomap_dio_rw(iocb, from, &ntfs_dio_iomap_ops,
-			&ntfs_write_dio_ops, 0, 0);
+			ntfs_file_write_dio_end_io, 0, 0);
 #else
 	ret = iomap_dio_rw(iocb, from, &ntfs_dio_iomap_ops,
-			&ntfs_write_dio_ops);
+			ntfs_file_write_dio_end_io);
 #endif
 #endif
 	if (ret == -ENOTBLK)
@@ -942,10 +968,14 @@ long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case FS_IOC_SHUTDOWN:
 		return ntfs_ioctl_shutdown(file_inode(filp)->i_sb, arg);
 #endif
+#ifdef FS_IOC_GETFSLABEL
 	case FS_IOC_GETFSLABEL:
 		return ntfs_ioctl_get_volume_label(filp, arg);
+#endif
+#ifdef FS_IOC_SETFSLABEL
 	case FS_IOC_SETFSLABEL:
 		return ntfs_ioctl_set_volume_label(filp, arg);
+#endif
 	case FITRIM:
 		return ntfs_ioctl_fitrim(NTFS_SB(file_inode(filp)->i_sb), arg);
 	default:

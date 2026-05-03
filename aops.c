@@ -15,6 +15,60 @@
 #include "debug.h"
 #include "iomap.h"
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+static int ntfs_get_block(struct inode *inode, sector_t iblock,
+		struct buffer_head *bh_result, int create)
+{
+	const struct iomap_ops *ops = create ? &ntfs_write_iomap_ops :
+					       &ntfs_read_iomap_ops;
+	struct iomap iomap = { };
+	loff_t pos = (loff_t)iblock << inode->i_blkbits;
+	loff_t len = i_blocksize(inode);
+	unsigned int flags = create ? IOMAP_WRITE : 0;
+	int ret;
+
+	ret = ops->iomap_begin(inode, pos, len, flags, &iomap);
+	if (ret)
+		return ret;
+
+	if (iomap.offset > pos || pos >= iomap.offset + iomap.length) {
+		ret = -EIO;
+		goto out;
+	}
+
+	switch (iomap.type) {
+	case IOMAP_HOLE:
+	case IOMAP_DELALLOC:
+		ret = 0;
+		break;
+	case IOMAP_MAPPED:
+	case IOMAP_UNWRITTEN:
+		map_bh(bh_result, inode->i_sb,
+		       ((iomap.blkno << SECTOR_SHIFT) +
+			(pos - iomap.offset)) >> inode->i_blkbits);
+		bh_result->b_size = min_t(loff_t, len,
+					  iomap.offset + iomap.length - pos);
+		if (iomap.flags & IOMAP_F_NEW)
+			set_buffer_new(bh_result);
+		ret = 0;
+		break;
+	default:
+		ret = -EIO;
+		break;
+	}
+out:
+	if (ops->iomap_end) {
+		int end_ret = ops->iomap_end(inode, pos, len, ret ? 0 : len,
+					     flags, &iomap);
+
+		if (!ret && end_ret < 0)
+			ret = end_ret;
+	}
+
+	return ret;
+}
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
 static void ntfs_iomap_read_end_io(struct bio *bio)
 {
@@ -110,6 +164,13 @@ static const struct iomap_read_ops ntfs_iomap_bio_read_ops = {
 	.submit_read		= ntfs_iomap_bio_submit_read,
 };
 #endif
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+static int ntfs_releasepage(struct page *page, gfp_t gfp)
+{
+	return try_to_free_buffers(page);
+}
 #endif
 
 /*
@@ -230,7 +291,7 @@ static int ntfs_readpage(struct file *file, struct page *page)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	return iomap_read_folio(folio, &ntfs_read_iomap_ops);
 #else
-	return iomap_readpage(page, &ntfs_read_iomap_ops);
+	return mpage_readpage(page, ntfs_get_block);
 #endif
 #endif
 #endif
@@ -263,7 +324,6 @@ static int ntfs_writepage(struct page *page, struct writeback_control *wbc)
 	loff_t i_size;
 	struct inode *vi = page->mapping->host;
 	struct ntfs_inode *ni = NTFS_I(vi);
-	struct iomap_writepage_ctx wpc = { };
 
 	BUG_ON(!PageLocked(page));
 
@@ -285,7 +345,7 @@ static int ntfs_writepage(struct page *page, struct writeback_control *wbc)
 
 		iomap_invalidate_folio(folio, 0, PAGE_SIZE);
 #else
-		iomap_invalidatepage(page, 0, PAGE_SIZE);
+		block_invalidatepage(page, 0, PAGE_SIZE);
 #endif
 		unlock_page(page);
 		ntfs_debug("Write outside i_size - truncated?");
@@ -317,7 +377,15 @@ static int ntfs_writepage(struct page *page, struct writeback_control *wbc)
 		}
 	}
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	{
+		struct iomap_writepage_ctx wpc = { };
+
 	return iomap_writepage(page, wbc, &wpc, &ntfs_writeback_ops);
+	}
+#else
+	return block_write_full_page(page, ntfs_get_block, wbc);
+#endif
 }
 #endif
 
@@ -442,6 +510,7 @@ hole:
 	return block;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 static void ntfs_readahead(struct readahead_control *rac)
 {
 	struct address_space *mapping = rac->mapping;
@@ -471,6 +540,18 @@ static void ntfs_readahead(struct readahead_control *rac)
 #endif
 #endif
 }
+#else
+static int ntfs_readpages(struct file *file, struct address_space *mapping,
+		struct list_head *pages, unsigned int nr_pages)
+{
+	struct ntfs_inode *ni = NTFS_I(mapping->host);
+
+	if (!NInoNonResident(ni) || NInoCompressed(ni))
+		return 0;
+
+	return mpage_readpages(mapping, pages, nr_pages, ntfs_get_block);
+}
+#endif
 
 static int ntfs_writepages(struct address_space *mapping,
 		struct writeback_control *wbc)
@@ -483,8 +564,6 @@ static int ntfs_writepages(struct address_space *mapping,
 		.wbc		= wbc,
 		.ops		= &ntfs_writeback_ops,
 	};
-#else
-	struct iomap_writepage_ctx wpc = { };
 #endif
 
 	if (NVolShutdown(ni->vol))
@@ -504,16 +583,22 @@ static int ntfs_writepages(struct address_space *mapping,
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 	return iomap_writepages(&wpc);
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	return iomap_writepages(mapping, wbc, &wpc, &ntfs_writeback_ops);
+#else
+	return mpage_writepages(mapping, wbc, ntfs_get_block);
 #endif
 }
 
 static int ntfs_swap_activate(struct swap_info_struct *sis,
 		struct file *swap_file, sector_t *span)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	return iomap_swapfile_activate(sis, swap_file, span,
 			&ntfs_read_iomap_ops);
+#else
+	return -EOPNOTSUPP;
+#endif
 }
 
 const struct address_space_operations ntfs_aops = {
@@ -522,12 +607,16 @@ const struct address_space_operations ntfs_aops = {
 #else
 	.readpage		= ntfs_readpage,
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 	.readahead		= ntfs_readahead,
+#else
+	.readpages		= ntfs_readpages,
+#endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
 	.writepage		= ntfs_writepage,
 #endif
 	.writepages		= ntfs_writepages,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
 	.direct_IO		= noop_direct_IO,
 #endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
@@ -547,9 +636,17 @@ const struct address_space_operations ntfs_aops = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
 	.migrate_folio		= filemap_migrate_folio,
 #else
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	.migratepage		= iomap_migrate_page,
+#else
+	.migratepage		= buffer_migrate_page,
 #endif
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	.is_partially_uptodate	= iomap_is_partially_uptodate,
+#else
+	.is_partially_uptodate	= block_is_partially_uptodate,
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
 	.error_remove_folio	= generic_error_remove_folio,
 #else
@@ -559,8 +656,8 @@ const struct address_space_operations ntfs_aops = {
 	.release_folio		= iomap_release_folio,
 	.invalidate_folio	= iomap_invalidate_folio,
 #else
-	.releasepage		= iomap_releasepage,
-	.invalidatepage		= iomap_invalidatepage,
+	.releasepage		= ntfs_releasepage,
+	.invalidatepage		= block_invalidatepage,
 #endif
 	.swap_activate          = ntfs_swap_activate,
 };
@@ -571,7 +668,11 @@ const struct address_space_operations ntfs_mft_aops = {
 #else
 	.readpage		= ntfs_readpage,
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 	.readahead		= ntfs_readahead,
+#else
+	.readpages		= ntfs_readpages,
+#endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
 	.writepage		= ntfs_writepage,
 #endif
@@ -593,9 +694,17 @@ const struct address_space_operations ntfs_mft_aops = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
 	.migrate_folio		= filemap_migrate_folio,
 #else
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	.migratepage		= iomap_migrate_page,
+#else
+	.migratepage		= buffer_migrate_page,
 #endif
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	.is_partially_uptodate	= iomap_is_partially_uptodate,
+#else
+	.is_partially_uptodate	= block_is_partially_uptodate,
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
 	.error_remove_folio	= generic_error_remove_folio,
 #else
@@ -605,7 +714,7 @@ const struct address_space_operations ntfs_mft_aops = {
 	.release_folio		= iomap_release_folio,
 	.invalidate_folio	= iomap_invalidate_folio,
 #else
-	.releasepage		= iomap_releasepage,
-	.invalidatepage		= iomap_invalidatepage,
+	.releasepage		= ntfs_releasepage,
+	.invalidatepage		= block_invalidatepage,
 #endif
 };

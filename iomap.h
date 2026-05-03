@@ -17,7 +17,9 @@ extern const struct iomap_ops ntfs_read_iomap_ops;
 extern const struct iomap_ops ntfs_seek_iomap_ops;
 extern const struct iomap_ops ntfs_page_mkwrite_iomap_ops;
 extern const struct iomap_ops ntfs_dio_iomap_ops;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 extern const struct iomap_writeback_ops ntfs_writeback_ops;
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 extern const struct iomap_write_ops ntfs_iomap_folio_ops;
 #endif

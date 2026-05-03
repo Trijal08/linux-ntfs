@@ -5,6 +5,7 @@
  * Copyright (c) 2001-2004 Anton Altaparmakov
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#include <linux/version.h>
 #include "debug.h"
 
 /*
@@ -45,11 +46,21 @@ void __ntfs_warning(const char *function, const struct super_block *sb,
 	else
 		pr_warn("%s(): %pV\n", flen ? function : "", &vaf);
 #else
-	if (sb)
+	if (sb) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
 		pr_warn_ratelimited("(device %s): %s(): %pV\n",
 			sb->s_id, flen ? function : "", &vaf);
-	else
+#else
+		pr_warn("(device %s): %s(): %pV\n",
+			sb->s_id, flen ? function : "", &vaf);
+#endif
+	} else {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
 		pr_warn_ratelimited("%s(): %pV\n", flen ? function : "", &vaf);
+#else
+		pr_warn("%s(): %pV\n", flen ? function : "", &vaf);
+#endif
+	}
 #endif
 	va_end(args);
 }
@@ -92,11 +103,21 @@ void __ntfs_error(const char *function, struct super_block *sb,
 	else
 		pr_err("%s(): %pV\n", flen ? function : "", &vaf);
 #else
-	if (sb)
+	if (sb) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
 		pr_err_ratelimited("(device %s): %s(): %pV\n",
 		       sb->s_id, flen ? function : "", &vaf);
-	else
+#else
+		pr_err("(device %s): %s(): %pV\n",
+		       sb->s_id, flen ? function : "", &vaf);
+#endif
+	} else {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
 		pr_err_ratelimited("%s(): %pV\n", flen ? function : "", &vaf);
+#else
+		pr_err("%s(): %pV\n", flen ? function : "", &vaf);
+#endif
+	}
 #endif
 	va_end(args);
 

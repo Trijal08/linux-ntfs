@@ -15,7 +15,7 @@
  * Copyright (c) 2007-2022 Jean-Pierre Andre
  */
 
-#include <linux/overflow.h>
+#include <linux/kernel.h>
 
 #include "ntfs.h"
 #include "attrib.h"

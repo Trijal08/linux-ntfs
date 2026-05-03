@@ -12,11 +12,13 @@
 #include <linux/vfs.h>
 #include <linux/fs_struct.h>
 #include <linux/sched/mm.h>
-#include <linux/fs_context.h>
-#include <linux/fs_parser.h>
 #include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
+#else
+#include <linux/parser.h>
+#endif
 
 #include "sysctl.h"
 #include "logfile.h"
@@ -41,6 +43,7 @@ enum {
 	ON_ERRORS_CONTINUE = 0x04,
 };
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
 static const struct constant_table ntfs_param_enums[] = {
 	{ "panic",		ON_ERRORS_PANIC },
 	{ "remount-ro",		ON_ERRORS_REMOUNT_RO },
@@ -296,6 +299,13 @@ static int ntfs_reconfigure(struct fs_context *fc)
 	ntfs_debug("Done.");
 	return 0;
 }
+#else
+static int parse_options(struct super_block *sb, char *options, int silent,
+		struct ntfs_volume *vol)
+{
+	return 0;
+}
+#endif
 
 const struct option_t on_errors_arr[] = {
 	{ ON_ERRORS_PANIC,	"panic" },
@@ -319,10 +329,12 @@ void ntfs_handle_error(struct super_block *sb)
 		panic("ntfs: (device %s): panic from previous error\n",
 		      sb->s_id);
 	} else if (vol->on_errors == ON_ERRORS_CONTINUE) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 		if (errseq_check(&sb->s_wb_err, vol->wb_err) == -ENODEV) {
 			NVolSetShutdown(vol);
 			vol->wb_err = sb->s_wb_err;
 		}
+#endif
 	}
 }
 
@@ -1953,7 +1965,11 @@ static void ntfs_put_super(struct super_block *sb)
 
 	iput(vol->mft_ino);
 	vol->mft_ino = NULL;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
 	blkdev_issue_flush(sb->s_bdev);
+#else
+	blkdev_issue_flush(sb->s_bdev, GFP_NOFS, NULL);
+#endif
 
 	ntfs_volume_free(vol);
 }
@@ -2015,7 +2031,11 @@ static int ntfs_sync_fs(struct super_block *sb, int wait)
 	}
 	sync_inodes_sb(sb);
 	sync_blockdev(sb->s_bdev);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
 	blkdev_issue_flush(sb->s_bdev);
+#else
+	blkdev_issue_flush(sb->s_bdev, GFP_NOFS, NULL);
+#endif
 	return err;
 }
 
@@ -2384,7 +2404,8 @@ static int ntfs_statfs(struct dentry *dentry, struct kstatfs *sfs)
 	 * the least significant 32-bits in f_fsid[0] and the most significant
 	 * 32-bits in f_fsid[1].
 	 */
-	sfs->f_fsid = u64_to_fsid(vol->serial_no);
+	sfs->f_fsid.val[0] = (u32)vol->serial_no;
+	sfs->f_fsid.val[1] = (u32)(vol->serial_no >> 32);
 	/* Maximum length of filenames. */
 	sfs->f_namelen	   = NTFS_MAX_NAME_LEN;
 
@@ -2442,14 +2463,48 @@ static struct lock_class_key ntfs_mft_inval_lock_key;
  * expectedly return an error, but nobody wants to see error messages when in
  * fact this is what is supposed to happen.
  */
-static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
+static int ntfs_fill_super(struct super_block *sb,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+		struct fs_context *fc)
+#else
+		void *data, int silent)
+#endif
 {
 	char *boot;
 	struct inode *tmp_ino;
 	int blocksize, result;
 	pgoff_t lcn_bit_pages;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
 	struct ntfs_volume *vol = NTFS_SB(sb);
 	int silent = fc->sb_flags & SB_SILENT;
+#else
+	struct ntfs_volume *vol;
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0)
+	vol = kzalloc(sizeof(*vol), GFP_NOFS);
+	if (!vol)
+		return -ENOMEM;
+
+	*vol = (struct ntfs_volume) {
+		.uid = INVALID_UID,
+		.gid = INVALID_GID,
+		.fmask = 0,
+		.dmask = 0,
+		.mft_zone_multiplier = 1,
+		.on_errors = ON_ERRORS_CONTINUE,
+		.nls_map = load_nls_default(),
+		.preallocated_size = NTFS_DEF_PREALLOC_SIZE,
+	};
+	NVolSetShowHiddenFiles(vol);
+	NVolSetCaseSensitive(vol);
+	init_rwsem(&vol->mftbmp_lock);
+	init_rwsem(&vol->lcnbmp_lock);
+	sb->s_fs_info = vol;
+	result = parse_options(sb, data, silent, vol);
+	if (result)
+		goto err_out_now;
+#endif
 
 	vol->sb = sb;
 
@@ -2780,6 +2835,7 @@ struct kmem_cache *ntfs_index_ctx_cache;
 /* Driver wide mutex. */
 DEFINE_MUTEX(ntfs_lock);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
 static int ntfs_get_tree(struct fs_context *fc)
 {
 	return get_tree_bdev(fc, ntfs_fill_super);
@@ -2830,14 +2886,29 @@ static int ntfs_init_fs_context(struct fs_context *fc)
 	fc->ops = &ntfs_context_ops;
 	return 0;
 }
+#else
+static struct dentry *ntfs_fs_mount(struct file_system_type *fs_type,
+		int flags, const char *dev_name, void *data)
+{
+	return mount_bdev(fs_type, flags, dev_name, data, ntfs_fill_super);
+}
+#endif
 
 static struct file_system_type ntfs_fs_type = {
 	.owner                  = THIS_MODULE,
 	.name                   = "ntfs",
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
 	.init_fs_context        = ntfs_init_fs_context,
 	.parameters             = ntfs_parameters,
+#else
+	.mount                  = ntfs_fs_mount,
+#endif
 	.kill_sb                = kill_block_super,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 	.fs_flags               = FS_REQUIRES_DEV | FS_ALLOW_IDMAP,
+#else
+	.fs_flags               = FS_REQUIRES_DEV,
+#endif
 };
 MODULE_ALIAS_FS("ntfs");
 

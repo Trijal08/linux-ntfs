@@ -77,8 +77,13 @@ int ntfs_trim_fs(struct ntfs_volume *vol, struct fstrim_range *range)
 			aligned_count =
 				ALIGN_DOWN(ntfs_cluster_to_bytes(vol, end - start), dq);
 			if (aligned_count >= range->minlen) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
 				ret = blkdev_issue_discard(vol->sb->s_bdev, aligned_start >> 9,
 						aligned_count >> 9, GFP_NOFS);
+#else
+				ret = blkdev_issue_discard(vol->sb->s_bdev, aligned_start >> 9,
+						aligned_count >> 9, GFP_NOFS, 0);
+#endif
 				if (ret)
 					goto out_unmap;
 				trimmed += aligned_count;

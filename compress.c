@@ -1467,7 +1467,7 @@ setup_bio:
 #else
 			bio = bio_alloc(GFP_NOIO, 1);
 			if (!bio)
-				return NULL;
+				return -ENOMEM;
 			bio_set_dev(bio, vol->sb->s_bdev);
 			bio->bi_opf = REQ_OP_WRITE;
 #endif
@@ -1510,7 +1510,11 @@ out:
 int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 		struct iov_iter *from)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
 	struct folio *folio;
+#else
+	struct page *folio_pagep;
+#endif
 	struct page **pages = NULL, *page;
 	int pages_per_cb = ni->itype.compressed.block_size >> PAGE_SHIFT;
 	int cb_size = ni->itype.compressed.block_size, cb_off, err = 0;
@@ -1551,6 +1555,7 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 		}
 
 		for (i = 0; i < pages_per_cb; i++) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
 			folio = read_mapping_folio(mapping, index + i, NULL);
 			if (IS_ERR(folio)) {
 				for (ip = 0; ip < i; ip++) {
@@ -1563,6 +1568,20 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 
 			folio_lock(folio);
 			pages[i] = folio_page(folio, 0);
+#else
+			folio_pagep = read_mapping_folio(mapping, index + i, NULL);
+			if (IS_ERR(folio_pagep)) {
+				for (ip = 0; ip < i; ip++) {
+					folio_unlock(page_folio(pages[ip]));
+					folio_put(page_folio(pages[ip]));
+				}
+				err = PTR_ERR(folio_pagep);
+				goto out;
+			}
+
+			folio_lock(folio_pagep);
+			pages[i] = folio_page(folio_pagep, 0);
+#endif
 		}
 
 		WARN_ON(!bytes);

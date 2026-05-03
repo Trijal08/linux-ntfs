@@ -24,6 +24,7 @@
 #include <linux/pagemap.h>
 #include <linux/uidgid.h>
 
+#include "ntfs_compat.h"
 #include "volume.h"
 #include "layout.h"
 #include "inode.h"

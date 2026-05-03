@@ -600,7 +600,7 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const u64 mft_no,
 #else
 	bio = bio_alloc(GFP_NOIO, 1);
 	if (!bio)
-		return NULL;
+		return -ENOMEM;
 	bio_set_dev(bio, vol->sb->s_bdev);
 	bio->bi_opf = REQ_OP_WRITE;
 #endif
@@ -744,14 +744,16 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 			goto put_bio_out;
 		}
 #else
-		bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE, GFP_NOIO);
-		bio->bi_iter.bi_sector =
-			NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, ni->mft_lcn[i]) +
-					 clu_off);
+		bio = bio_alloc(GFP_NOIO, 1);
 		if (!bio) {
 			err = -ENOMEM;
 			goto err_out;
 		}
+		bio_set_dev(bio, vol->sb->s_bdev);
+		bio->bi_opf = REQ_OP_WRITE;
+		bio->bi_iter.bi_sector =
+			NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, ni->mft_lcn[i]) +
+					 clu_off);
 
 		if (!bio_add_page(bio, page, folio_size,
 				  ni->page_ofs + offset)) {
@@ -844,7 +846,11 @@ static int ntfs_test_inode_wb(struct inode *vi, unsigned long ino, void *data)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
 	if (inode_state_read_once(vi) & I_CREATING) {
 #else
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 	if (vi->i_state & I_CREATING) {
+#else
+	if (0) {
+#endif
 #endif
 		spin_unlock(&vi->i_lock);
 		na->state = NI_BeingCreated;
@@ -3411,7 +3417,7 @@ flush_bio:
 #else
 				bio = bio_alloc(GFP_NOIO, 1);
 				if (!bio)
-					return NULL;
+					return -ENOMEM;
 				bio_set_dev(bio, vol->sb->s_bdev);
 				bio->bi_opf = REQ_OP_WRITE;
 #endif
